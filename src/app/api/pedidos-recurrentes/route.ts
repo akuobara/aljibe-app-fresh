@@ -1,0 +1,120 @@
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { getSession, getDuenoId } from "@/lib/auth";
+import { checkDemoBlock } from "@/lib/demo-guard";
+
+// GET /api/pedidos-recurrentes
+export async function GET() {
+  const session = await getSession();
+  if (!session) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  const duenoId = await getDuenoId();
+  if (!duenoId) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  const recurrentes = await db.pedidoRecurrente.findMany({
+    where: { duenoId },
+    orderBy: { fechaProximaGeneracion: "asc" },
+    include: {
+      cliente: {
+        select: {
+          id: true, nombre: true, direccion: true, telefono: true, zona: true,
+          lat: true, lng: true, indicacionesAcceso: true,
+        },
+      },
+      choferAsignado: { select: { id: true, nombre: true } },
+      _count: { select: { pedidos: true } },
+    },
+  });
+
+  return NextResponse.json({ recurrentes });
+}
+
+// POST /api/pedidos-recurrentes
+export async function POST(req: NextRequest) {
+  const _demoBlocked = await checkDemoBlock();
+  if (_demoBlocked) return _demoBlocked;
+
+  const session = await getSession();
+  if (!session) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+  // Choferes Y dueños pueden crear pedidos recurrentes.
+  // El duenoId se obtiene de la sesión (para choferes es session.duenoId).
+  const duenoId = session.role === "chofer" ? session.duenoId : session.userId;
+  if (!duenoId) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  try {
+    const body = await req.json();
+
+    if (!body.clienteId) {
+      return NextResponse.json({ error: "Cliente es obligatorio (debe ser del catálogo)" }, { status: 400 });
+    }
+
+    const cliente = await db.cliente.findUnique({ where: { id: body.clienteId } });
+    if (!cliente || cliente.duenoId !== duenoId) {
+      return NextResponse.json({ error: "Cliente no encontrado" }, { status: 404 });
+    }
+
+    const frecuenciaDias = Number(body.frecuenciaDias) || 0;
+    if (frecuenciaDias <= 0) {
+      return NextResponse.json({ error: "La frecuencia debe ser mayor a 0 días" }, { status: 400 });
+    }
+
+    const litros = Number(body.litrosSolicitados) || 0;
+    if (litros <= 0) {
+      return NextResponse.json({ error: "Los litros deben ser mayores a 0" }, { status: 400 });
+    }
+
+    const fechaInicio = body.fechaInicio ? new Date(body.fechaInicio) : new Date();
+    const fechaProxima = new Date(fechaInicio);
+
+    // Día de la semana preferido (solo para frecuencia 7 = semanal)
+    // 0=domingo, 1=lunes, ..., 6=sábado
+    // Si está seteado, la próxima fecha de generación SIEMPRE cae en ese día.
+    let diaSemanaPreferido: number | null = null;
+    if (frecuenciaDias === 7 && body.diaSemanaPreferido !== undefined && body.diaSemanaPreferido !== null && body.diaSemanaPreferido !== "") {
+      const dia = Number(body.diaSemanaPreferido);
+      if (dia >= 0 && dia <= 6) {
+        diaSemanaPreferido = dia;
+        // Si se setea día preferido, realinear la fechaProxima a ese día
+        // (snap hacia adelante: si fechaInicio ya es ese día, queda igual; si no, va al próximo)
+        const diaActual = fechaProxima.getDay();
+        const diff = (dia - diaActual + 7) % 7;
+        fechaProxima.setDate(fechaProxima.getDate() + diff);
+        fechaProxima.setUTCHours(0, 0, 0, 0);
+      }
+    }
+
+    const nuevo = await db.pedidoRecurrente.create({
+      data: {
+        clienteId: cliente.id,
+        litrosSolicitados: litros,
+        metodoPagoPreferido: body.metodoPagoPreferido || "efectivo",
+        nota: body.nota?.trim() || null,
+        frecuenciaDias,
+        fechaInicio,
+        fechaProximaGeneracion: fechaProxima,
+        activo: body.activo !== false,
+        diaSemanaPreferido,
+        asignacionTipo: body.asignacionTipo || "manual",
+        choferAsignadoId: (body.choferAsignadoId && body.choferAsignadoId !== "__ninguno") ? body.choferAsignadoId : null,
+        duenoId: duenoId,
+      },
+      include: {
+        cliente: { select: { id: true, nombre: true, zona: true } },
+        choferAsignado: { select: { id: true, nombre: true } },
+      },
+    });
+
+    return NextResponse.json({ recurrente: nuevo }, { status: 201 });
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ error: "No se pudo crear el pedido recurrente" }, { status: 500 });
+  }
+}

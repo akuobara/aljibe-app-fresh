@@ -1,0 +1,344 @@
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { getSession, getDuenoId } from "@/lib/auth";
+import { parseDateTimeLocalInput, calcularProximaFechaConDiaPreferido } from "@/lib/helpers";
+import { checkDemoBlock } from "@/lib/demo-guard";
+
+// GET /api/pedidos?estado=...&clienteId=...&disponibles=true
+// - Dueño: ve todos sus pedidos
+// - Chofer: ve pedidos asignados a él + publicados (sin asignar) + los que él creó
+export async function GET(req: NextRequest) {
+  const session = await getSession();
+  if (!session) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  const duenoId = await getDuenoId();
+  if (!duenoId) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  // === GENERAR PEDIDOS RECURRENTES (vencidos + próximos 7 días) ===
+  // IMPORTANTE: esta lógica también corre en el cron diario (/api/cron/generar-recurrentes).
+  // Para evitar doble avance de fechaProximaGeneracion, el dedup check busca CUALQUIER pedido
+  // con el mismo pedidoRecurrenteId + fechaSolicitada (sin importar estado).
+  // Si ya existe (incluso entregado/cancelado), se avanza sin crear duplicado.
+  const ahora = new Date();
+  const en7dias = new Date(ahora);
+  en7dias.setDate(en7dias.getDate() + 7);
+  const recurrentesVencidos = await db.pedidoRecurrente.findMany({
+    where: {
+      duenoId,
+      activo: true,
+      fechaProximaGeneracion: { lte: en7dias },
+    },
+    include: { cliente: true },
+  });
+
+  for (const rec of recurrentesVencidos) {
+    // Dedup: buscar CUALQUIER pedido existente para este recurrente con la misma fechaSolicitada.
+    // Sin importar el estado (incluso entregado/cancelado) — si ya fue creado para esa fecha,
+    // no crear otro. Solo avanzar fechaProximaGeneracion.
+    const existente = await db.pedido.findFirst({
+      where: {
+        pedidoRecurrenteId: rec.id,
+        fechaSolicitada: rec.fechaProximaGeneracion,
+      },
+    });
+    if (existente) {
+      // Ya existe un pedido para esta fecha (pendiente, programado, entregado o cancelado).
+      // Avanzar fechaProximaGeneracion a la próxima fecha.
+      const proxima = calcularProximaFechaConDiaPreferido(
+        rec.fechaProximaGeneracion,
+        rec.frecuenciaDias,
+        rec.diaSemanaPreferido
+      );
+      await db.pedidoRecurrente.update({
+        where: { id: rec.id },
+        data: { fechaProximaGeneracion: proxima },
+      });
+      continue;
+    }
+
+    await db.pedido.create({
+      data: {
+        clienteNombre: rec.cliente.nombre,
+        clienteDireccion: rec.cliente.direccion,
+        clienteTelefono: rec.cliente.telefono,
+        clienteZona: rec.cliente.zona,
+        clienteLat: rec.cliente.lat,
+        clienteLng: rec.cliente.lng,
+        clienteId: rec.clienteId,
+        litrosSolicitados: rec.litrosSolicitados,
+        fechaSolicitada: rec.fechaProximaGeneracion,
+        metodoPagoPreferido: rec.metodoPagoPreferido,
+        nota: rec.nota,
+        // Si la fecha es futura, marcar como "programado"; si es hoy o pasada, "pendiente"
+        estado: rec.fechaProximaGeneracion > ahora ? "programado" : "pendiente",
+        choferId: session.userId,
+        duenoId,
+        asignacionTipo: rec.asignacionTipo,
+        choferAsignadoId: rec.choferAsignadoId,
+        prioridadTipo: "ninguna",
+        pedidoRecurrenteId: rec.id,
+      },
+    });
+
+    const proxima = calcularProximaFechaConDiaPreferido(
+      rec.fechaProximaGeneracion,
+      rec.frecuenciaDias,
+      rec.diaSemanaPreferido
+    );
+    await db.pedidoRecurrente.update({
+      where: { id: rec.id },
+      data: { fechaProximaGeneracion: proxima },
+    });
+  }
+
+  const { searchParams } = new URL(req.url);
+  const estado = searchParams.get("estado");
+  const clienteId = searchParams.get("clienteId");
+  const soloDisponibles = searchParams.get("disponibles") === "true";
+
+  const where: Record<string, unknown> = { duenoId };
+  if (estado) where.estado = estado;
+  if (clienteId) where.clienteId = clienteId;
+
+  if (session.role === "chofer") {
+    // Choferes ven TODOS los pedidos del administrador (pendientes, programados, en_ruta)
+    // más los que ellos tomaron o crearon (incluso entregados/cancelados)
+    if (soloDisponibles) {
+      // Solo pedidos disponibles para tomar (publicados y sin tomar)
+      where.AND = [
+        { asignacionTipo: "publicado" },
+        { tomadoPorChoferId: null },
+        { estado: { in: ["pendiente", "programado"] } },
+      ];
+    } else {
+      // Ver todos los pedidos pendientes/programados/en_ruta del administrador
+      // + los que él tomó o creó (incluso entregados)
+      where.OR = [
+        { estado: { in: ["pendiente", "programado", "en_ruta"] } },
+        { tomadoPorChoferId: session.userId },
+        { choferId: session.userId },
+      ];
+    }
+  } else if (soloDisponibles) {
+    // Dueño pidió "disponibles": pedidos publicados sin tomar
+    where.AND = [
+      { asignacionTipo: "publicado" },
+      { tomadoPorChoferId: null },
+    ];
+  }
+
+  const pedidos = await db.pedido.findMany({
+    where,
+    orderBy: [
+      { fechaSolicitada: "asc" },
+      { creadoEn: "desc" },
+    ],
+    include: {
+      cliente: {
+        select: {
+          id: true,
+          nombre: true,
+          direccion: true,
+          telefono: true,
+          zona: true,
+          lat: true,
+          lng: true,
+          requiereIngresoPropiedad: true,
+          entregaDesdeAfuera: true,
+          conexionExterna: true,
+          requiereClientePresente: true,
+          indicacionesAcceso: true,
+          choferPreferidoId: true,
+        },
+      },
+      chofer: { select: { id: true, nombre: true } },
+      choferAsignado: { select: { id: true, nombre: true } },
+      tomadoPorChofer: { select: { id: true, nombre: true } },
+      prioridadChofer: { select: { id: true, nombre: true } },
+      entrega: {
+        select: {
+          id: true,
+          litros: true,
+          total: true,
+          fecha: true,
+          vuelta: { select: { id: true, numero: true } },
+        },
+      },
+      vuelta: { select: { id: true, numero: true } },
+    },
+  });
+
+  // Adjuntar el campo `orden` (raw SQL porque la columna se agrega con migración lazy)
+  let ordenMap: Record<string, number> = {};
+  try {
+    const ordenRows: Array<{ id: string; orden: number }> = await db.$queryRawUnsafe(
+      `SELECT "id", "orden" FROM "Pedido" WHERE "id" IN (${pedidos.map(() => "?").join(",")});`,
+      ...pedidos.map((p) => p.id)
+    );
+    ordenMap = Object.fromEntries(ordenRows.map((r) => [r.id, r.orden]));
+  } catch {
+    // La columna `orden` no existe todavía — todos los pedidos tienen orden 0
+  }
+
+  const pedidosConOrden = pedidos.map((p) => ({
+    ...p,
+    orden: ordenMap[p.id] ?? 0,
+  }));
+
+  return NextResponse.json({ pedidos: pedidosConOrden });
+}
+
+// POST /api/pedidos
+export async function POST(req: NextRequest) {
+  const _demoBlocked = await checkDemoBlock();
+  if (_demoBlocked) return _demoBlocked;
+
+  const session = await getSession();
+  if (!session) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  const duenoId = await getDuenoId();
+  if (!duenoId) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  // Los choferes siempre pueden crear pedidos (es su trabajo en el terreno).
+  // Antes había un toggle choferesPuedenCrearPedidos que generaba confusión —
+  // se eliminó porque los choferes necesitan agendar pedidos cuando los clientes
+  // les piden agua por teléfono o en persona.
+
+  try {
+    const body = await req.json();
+
+    // Si es cliente existente, autollenar datos
+    let clienteData: {
+      clienteId: string | null;
+      clienteNombre: string;
+      clienteDireccion: string | null;
+      clienteTelefono: string | null;
+      clienteZona: string | null;
+      clienteLat: number | null;
+      clienteLng: number | null;
+      indicacionesAcceso: string | null;
+    } = {
+      clienteId: null,
+      clienteNombre: "Sin nombre",
+      clienteDireccion: null,
+      clienteTelefono: null,
+      clienteZona: null,
+      clienteLat: null,
+      clienteLng: null,
+      indicacionesAcceso: null,
+    };
+    let clienteId: string | null = null;
+    if (body.clienteId && body.clienteId !== "__nuevo") {
+      const cliente = await db.cliente.findUnique({ where: { id: body.clienteId } });
+      if (!cliente || cliente.duenoId !== duenoId) {
+        return NextResponse.json({ error: "Cliente no encontrado" }, { status: 404 });
+      }
+      clienteId = cliente.id;
+      clienteData = {
+        clienteId: cliente.id,
+        clienteNombre: cliente.nombre,
+        clienteDireccion: cliente.direccion,
+        clienteTelefono: cliente.telefono,
+        clienteZona: cliente.zona,
+        clienteLat: cliente.lat,
+        clienteLng: cliente.lng,
+        indicacionesAcceso: cliente.indicacionesAcceso,
+      };
+    } else {
+      // Cliente nuevo
+      clienteData = {
+        clienteId: null,
+        clienteNombre: body.clienteNombre?.trim() || "Sin nombre",
+        clienteDireccion: body.clienteDireccion?.trim() || null,
+        clienteTelefono: body.clienteTelefono?.trim() || null,
+        clienteZona: body.clienteZona?.trim() || null,
+        clienteLat: body.clienteLat != null && body.clienteLat !== "" ? Number(body.clienteLat) : null,
+        clienteLng: body.clienteLng != null && body.clienteLng !== "" ? Number(body.clienteLng) : null,
+        indicacionesAcceso: body.indicacionesAcceso?.trim() || null,
+      };
+    }
+
+    // === Lógica de asignación ===
+    let asignacionTipo = body.asignacionTipo || "manual";
+    let choferAsignadoId: string | null = null;
+    let prioridadChoferId: string | null = null;
+    let prioridadTipo = "ninguna";
+    let publicadoEn: Date | null = null;
+
+    // Si el cliente tiene choferPreferido, asignar prioridad permanente a ese chofer
+    if (clienteId) {
+      const cliente = await db.cliente.findUnique({ where: { id: clienteId } });
+      if (cliente?.choferPreferidoId) {
+        prioridadChoferId = cliente.choferPreferidoId;
+        prioridadTipo = "permanente";
+      }
+    }
+
+    // Si el chofer crea el pedido y el cliente es nuevo, tiene prioridad permanente
+    if (session.role === "chofer" && !clienteId) {
+      prioridadChoferId = session.userId;
+      prioridadTipo = "permanente";
+    }
+
+    // Si el chofer crea el pedido para un cliente existente que ya tiene choferPreferido, respetar eso
+    if (session.role === "chofer" && clienteId) {
+      const cliente = await db.cliente.findUnique({ where: { id: clienteId } });
+      if (cliente?.choferPreferidoId && cliente.choferPreferidoId !== session.userId) {
+        // El cliente tiene otro chofer preferido — asignar a ese chofer
+        choferAsignadoId = cliente.choferPreferidoId;
+        asignacionTipo = "manual";
+      } else if (cliente?.choferPreferidoId === session.userId) {
+        // El chofer es el preferido del cliente — asignar a él
+        choferAsignadoId = session.userId;
+        asignacionTipo = "manual";
+      }
+    }
+
+    // Dueño puede elegir asignación
+    if (session.role === "dueno") {
+      if (asignacionTipo === "manual") {
+        choferAsignadoId = (body.choferAsignadoId && body.choferAsignadoId !== "__ninguno") ? body.choferAsignadoId : null;
+      } else if (asignacionTipo === "publicado") {
+        publicadoEn = new Date();
+      }
+    }
+
+    const nuevo = await db.pedido.create({
+      data: {
+        ...clienteData,
+        litrosSolicitados: Number(body.litrosSolicitados) || 0,
+        fechaSolicitada: body.fechaSolicitada ? parseDateTimeLocalInput(body.fechaSolicitada) : null,
+        franjaHoraria: body.franjaHoraria || null,
+        metodoPagoPreferido: body.metodoPagoPreferido || "efectivo",
+        nota: body.nota?.trim() || null,
+        estado: body.estado || "pendiente",
+        choferId: session.userId,
+        duenoId,
+        asignacionTipo,
+        choferAsignadoId,
+        prioridadChoferId,
+        prioridadTipo,
+        publicadoEn,
+      },
+      include: {
+        cliente: { select: { id: true, nombre: true, zona: true, lat: true, lng: true } },
+        chofer: { select: { id: true, nombre: true } },
+        choferAsignado: { select: { id: true, nombre: true } },
+        prioridadChofer: { select: { id: true, nombre: true } },
+      },
+    });
+
+    return NextResponse.json({ pedido: nuevo }, { status: 201 });
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ error: "No se pudo crear el pedido" }, { status: 500 });
+  }
+}

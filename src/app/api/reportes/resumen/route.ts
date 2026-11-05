@@ -1,0 +1,146 @@
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { getSession, getDuenoId } from "@/lib/auth";
+import { getRange } from "@/lib/helpers";
+
+export async function GET(req: NextRequest) {
+  const session = await getSession();
+  if (!session) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  const duenoId = await getDuenoId();
+  if (!duenoId) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  }
+
+  const { searchParams } = new URL(req.url);
+  const period = searchParams.get("period") || "hoy";
+  const { start, end } = getRange(period);
+
+  const rangeFilter = {
+    AND: [start ? { fecha: { gte: start } } : {}, end ? { fecha: { lt: end } } : {}],
+  };
+  const rangeFilterVuelta = {
+    AND: [start ? { iniciadaEn: { gte: start } } : {}, end ? { iniciadaEn: { lt: end } } : {}],
+  };
+
+  const entregaWhere = { ...rangeFilter, duenoId, ...(session.role === "chofer" ? { choferId: session.userId } : {}) };
+  const gastoWhere = { ...rangeFilter, duenoId, ...(session.role === "chofer" ? { choferId: session.userId } : {}) };
+  const vueltaWhere = { ...rangeFilterVuelta, duenoId, ...(session.role === "chofer" ? { choferId: session.userId } : {}) };
+
+  const [entregas, gastos, vueltas, config, pagosSueltos] = await Promise.all([
+    db.entrega.findMany({ where: entregaWhere }),
+    db.gasto.findMany({ where: gastoWhere }),
+    db.vuelta.findMany({
+      where: vueltaWhere,
+      include: { entregas: { select: { id: true, litros: true, total: true, montoEfectivo: true, montoTransferencia: true, montoRecibido: true } } },
+    }),
+    db.configuracion.findUnique({ where: { duenoId } }),
+    db.pago.findMany({
+      where: { ...rangeFilter, duenoId },
+      select: { monto: true, metodoPago: true },
+    }),
+  ]);
+
+  const cfg = config ?? {
+    modoLiquidacion: "porcentaje",
+    montoPorVueltaUnicoCliente: 20000,
+    montoPorVueltaMultiple: 25000,
+    capacidadCamion: 17000,
+    porcentajeComisionChofer: 50,
+    porcentajeComisionDueno: 50,
+  };
+
+  const totalVentas = entregas.reduce((s, e) => s + e.total, 0);
+  const totalEfectivoEntregas = entregas.reduce((s, e) => s + e.montoEfectivo, 0);
+  const totalTransferenciaEntregas = entregas.reduce((s, e) => s + e.montoTransferencia, 0);
+
+  // Pagos sueltos (cobros de deuda registrados por chofer o admin)
+  const pagosSueltosEfectivo = pagosSueltos.filter(p => p.metodoPago === "efectivo").reduce((s, p) => s + p.monto, 0);
+  const pagosSueltosTransferencia = pagosSueltos.filter(p => p.metodoPago === "transferencia").reduce((s, p) => s + p.monto, 0);
+
+  // Totales incluyen entregas + pagos sueltos
+  const totalEfectivoRecibido = totalEfectivoEntregas + pagosSueltosEfectivo;
+  const totalTransferenciaRecibida = totalTransferenciaEntregas + pagosSueltosTransferencia;
+  const totalRecibido = totalEfectivoRecibido + totalTransferenciaRecibida;
+  const totalPorCobrar = entregas.reduce((s, e) => s + Math.max(0, e.total - e.montoRecibido), 0) - pagosSueltos.reduce((s, p) => s + p.monto, 0);
+  const totalPorCobrarFinal = Math.max(0, totalPorCobrar);
+  const totalLitros = entregas.reduce((s, e) => s + e.litros, 0);
+  const totalGastos = gastos.reduce((s, g) => s + g.monto, 0);
+  const gastosChofer = gastos.filter((g) => g.pagadoPor === "chofer").reduce((s, g) => s + g.monto, 0);
+  const gastosDueno = gastos.filter((g) => g.pagadoPor === "dueno").reduce((s, g) => s + g.monto, 0);
+
+  const gastosPorTipo: Record<string, number> = {};
+  for (const g of gastos) {
+    gastosPorTipo[g.tipo] = (gastosPorTipo[g.tipo] ?? 0) + g.monto;
+  }
+
+  const utilidadBruta = totalVentas - totalGastos;
+
+  // Filtrar vueltas fantasma: las que tienen 0 entregas NO cuentan como vueltas reales.
+  // Estas suelen ser vueltas abiertas por error (p.ej. el dueño abre una vuelta con su sesión
+  // de dueño en vez del chofer, o un doble-click) y nunca se les cargó ninguna entrega.
+  // El dashboard no debe mostrarlas en el conteo ni en la lista de vueltas del período.
+  const vueltasReales = vueltas.filter((v) => v.entregas.length > 0);
+
+  let pagoChofer = 0;
+  const vueltasResumen = vueltasReales.map((v) => {
+    const numEntregas = v.entregas.length;
+    const esMultiple = numEntregas > 1;
+    const monto = esMultiple ? cfg.montoPorVueltaMultiple : cfg.montoPorVueltaUnicoCliente;
+    // Solo acumular pagoChofer si el modo de liquidación es "vuelta"
+    if (cfg.modoLiquidacion === "vuelta") {
+      pagoChofer += monto;
+    }
+    return { id: v.id, numero: v.numero, cantidadEntregas: numEntregas, esMultiple, montoPago: monto };
+  });
+
+  // En modo porcentaje, calcular pagoChofer como porcentaje de utilidad
+  if (cfg.modoLiquidacion !== "vuelta") {
+    pagoChofer = (utilidadBruta * cfg.porcentajeComisionChofer) / 100;
+  }
+
+  // Construir detalle de vueltas para el dashboard (solo vueltas con entregas reales)
+  const vueltasDetalle = vueltasReales.map((v) => {
+    const litros = v.entregas.reduce((s, e) => s + e.litros, 0);
+    const ventas = v.entregas.reduce((s, e) => s + e.total, 0);
+    const efectivo = v.entregas.reduce((s, e) => s + e.montoEfectivo, 0);
+    const transferencia = v.entregas.reduce((s, e) => s + e.montoTransferencia, 0);
+    const numEntregas = v.entregas.length;
+    return {
+      id: v.id,
+      numero: v.numero,
+      iniciadaEn: v.iniciadaEn,
+      cerradaEn: v.cerradaEn,
+      activa: v.activa,
+      litros,
+      ventas,
+      efectivo,
+      transferencia,
+      numEntregas,
+    };
+  }).sort((a, b) => new Date(b.iniciadaEn).getTime() - new Date(a.iniciadaEn).getTime());
+
+  return NextResponse.json({
+    period,
+    totalVentas,
+    totalEfectivoRecibido,
+    totalTransferenciaRecibida,
+    totalRecibido,
+    totalPorCobrar: totalPorCobrarFinal,
+    totalLitros,
+    totalGastos,
+    gastosChofer,
+    gastosDueno,
+    gastosPorTipo,
+    utilidadBruta,
+    cantidadEntregas: entregas.length,
+    cantidadGastos: gastos.length,
+    cantidadVueltas: vueltasReales.length,
+    pagoChoferCalculado: pagoChofer,
+    capacidadCamion: cfg.capacidadCamion,
+    modoLiquidacion: cfg.modoLiquidacion,
+    vueltas: vueltasDetalle,
+  });
+}
